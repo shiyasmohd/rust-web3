@@ -40,11 +40,20 @@ impl std::fmt::Debug for Http {
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     url: Url,
     id: AtomicUsize,
     header_inspector: Option<HeaderInspector>,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("url", &self.url)
+            .field("id", &self.id)
+            .field("header_inspector", &self.header_inspector.is_some())
+            .finish()
+    }
 }
 
 impl Http {
