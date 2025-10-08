@@ -19,18 +19,32 @@ use std::{
     },
 };
 
+/// Callback for inspecting response headers
+pub type HeaderInspector = Arc<dyn Fn(&reqwest::header::HeaderMap, &str) + Send + Sync>;
+
 /// HTTP Transport
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Http {
     // Client is already an Arc so doesn't need to be part of inner.
     client: Client,
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for Http {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http")
+            .field("client", &self.client)
+            .field("url", &self.inner.url)
+            .field("id", &self.inner.id)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct Inner {
     url: Url,
     id: AtomicUsize,
+    header_inspector: Option<HeaderInspector>,
 }
 
 impl Http {
@@ -54,11 +68,22 @@ impl Http {
 
     /// Like `new` but with a user provided client instance.
     pub fn with_client(client: Client, url: Url) -> Self {
+        Self::with_client_and_header_inspector(client, url, None)
+    }
+
+    /// Like `with_client` but with an optional header inspector callback.
+    /// The callback will be invoked with the response headers and the JSON-RPC method name.
+    pub fn with_client_and_header_inspector(
+        client: Client,
+        url: Url,
+        header_inspector: Option<HeaderInspector>,
+    ) -> Self {
         Self {
             client,
             inner: Arc::new(Inner {
                 url,
                 id: AtomicUsize::new(0),
+                header_inspector,
             }),
         }
     }
@@ -67,13 +92,24 @@ impl Http {
         self.inner.id.fetch_add(1, Ordering::AcqRel)
     }
 
-    fn new_request(&self) -> (Client, Url) {
-        (self.client.clone(), self.inner.url.clone())
+    fn new_request(&self) -> (Client, Url, Option<HeaderInspector>) {
+        (
+            self.client.clone(),
+            self.inner.url.clone(),
+            self.inner.header_inspector.clone(),
+        )
     }
 }
 
 // Id is only used for logging.
-async fn execute_rpc<T: DeserializeOwned>(client: &Client, url: Url, request: &Request, id: RequestId) -> Result<T> {
+async fn execute_rpc<T: DeserializeOwned>(
+    client: &Client,
+    url: Url,
+    request: &Request,
+    id: RequestId,
+    header_inspector: &Option<HeaderInspector>,
+    method: &str,
+) -> Result<T> {
     log::debug!("[id:{}] sending request: {:?}", id, serde_json::to_string(&request)?);
     let response = client
         .post(url)
@@ -82,6 +118,12 @@ async fn execute_rpc<T: DeserializeOwned>(client: &Client, url: Url, request: &R
         .await
         .map_err(|err| Error::Transport(TransportError::Message(format!("failed to send request: {}", err))))?;
     let status = response.status();
+
+    // Call header inspector if present
+    if let Some(inspector) = header_inspector {
+        inspector(response.headers(), method);
+    }
+
     let response = response.bytes().await.map_err(|err| {
         Error::Transport(TransportError::Message(format!(
             "failed to read response bytes: {}",
@@ -116,9 +158,15 @@ impl Transport for Http {
     }
 
     fn send(&self, id: RequestId, call: Call) -> Self::Out {
-        let (client, url) = self.new_request();
+        let (client, url, header_inspector) = self.new_request();
+        // Extract method name from the call
+        let method = match &call {
+            Call::MethodCall(m) => m.method.clone(),
+            _ => String::from("unknown"),
+        };
         Box::pin(async move {
-            let output: Output = execute_rpc(&client, url, &Request::Single(call), id).await?;
+            let output: Output =
+                execute_rpc(&client, url, &Request::Single(call), id, &header_inspector, &method).await?;
             helpers::to_result_from_output(output)
         })
     }
@@ -133,10 +181,11 @@ impl BatchTransport for Http {
     {
         // Batch calls don't need an id but it helps associate the response log with the request log.
         let id = self.next_id();
-        let (client, url) = self.new_request();
+        let (client, url, header_inspector) = self.new_request();
         let (ids, calls): (Vec<_>, Vec<_>) = requests.into_iter().unzip();
         Box::pin(async move {
-            let outputs: Vec<Output> = execute_rpc(&client, url, &Request::Batch(calls), id).await?;
+            let outputs: Vec<Output> =
+                execute_rpc(&client, url, &Request::Batch(calls), id, &header_inspector, "batch").await?;
             handle_batch_response(&ids, outputs)
         })
     }
